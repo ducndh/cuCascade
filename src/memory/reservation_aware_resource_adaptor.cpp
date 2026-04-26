@@ -27,6 +27,7 @@
 #include <cuda_runtime_api.h>
 
 #include <atomic>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -143,8 +144,40 @@ std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handl
   std::size_t upstream_tracking_size = allocation_size;
 
   auto reservation_size = static_cast<int64_t>(memory_reservation->size());
+  int64_t arena_before  = memory_reservation->allocated_bytes.load();
   auto [success, post_allocation_inc] =
     memory_reservation->allocated_bytes.try_add(stream_tracking_size, reservation_size);
+
+  // [INSTRUMENTATION] OVER-BUDGET-ADMISSION: try_add succeeds because the arena
+  // is already NEGATIVE (cross-stream phantoms drove it below 0).  If the arena
+  // had been at its correct value (>= 0), this same try_add would have failed
+  // and triggered reservation_policy->handle_over_reservation() — i.e. the
+  // pipeline would have been forced to either grow its reservation or back off.
+  // PR #100 does not touch this code path; per-reservation budget enforcement
+  // is silently bypassed.
+  if (success && arena_before < 0) {
+    int64_t admitted_via_negative_arena =
+      std::min(stream_tracking_size, -arena_before);  // bytes that would have hit the cap
+    static std::atomic<int> count{0};
+    static std::atomic<long long> total_overspend{0};
+    total_overspend.fetch_add(admitted_via_negative_arena, std::memory_order_relaxed);
+    int n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n < 50) {
+      std::fprintf(stderr,
+                   "[OVER-BUDGET-ADMISSION #%d] arena_before=%ld alloc_size=%ld "
+                   "reservation_size=%ld -> try_add SUCCEEDED (would have FAILED "
+                   "with correct arena=0); %ld bytes of this allocation overflow "
+                   "the reservation budget; running_total_overspend=%lld\n",
+                   n,
+                   arena_before,
+                   stream_tracking_size,
+                   reservation_size,
+                   admitted_via_negative_arena,
+                   total_overspend.load(std::memory_order_relaxed));
+      std::fflush(stderr);
+    }
+  }
+
   if (!success) {
     if (reservation_policy) {
       std::lock_guard lock(_arbitration_mutex);
@@ -163,6 +196,34 @@ std::size_t impl_type::stream_ordered_tracker_state::check_reservation_and_handl
   } else if (pre_allocation_inc < reservation_size) {
     upstream_tracking_size = static_cast<std::size_t>(post_allocation_inc - reservation_size);
   }
+
+  // [INSTRUMENTATION] UNTRACKED-ALLOC: when an arena was previously driven
+  // negative by a cross-stream dealloc, subsequent allocs through this
+  // reservation slip through try_add (current is negative, plenty of headroom)
+  // and end up with upstream_tracking_size=0 -> they allocate REAL GPU memory
+  // without incrementing _total_allocated_bytes.  PR #100's mask in
+  // memory_space.cpp does not protect against this — the global counter
+  // simply UNDER-counts actual GPU residency.
+  if (pre_allocation_inc < 0 && upstream_tracking_size < allocation_size) {
+    static std::atomic<int> count{0};
+    static std::atomic<long long> total_untracked{0};
+    long long missed = static_cast<long long>(allocation_size - upstream_tracking_size);
+    total_untracked.fetch_add(missed, std::memory_order_relaxed);
+    int n = count.fetch_add(1, std::memory_order_relaxed);
+    if (n < 50) {
+      std::fprintf(
+        stderr,
+        "[UNTRACKED-ALLOC #%d] pre_arena=%ld post_arena=%ld reservation_size=%ld "
+        "alloc_size=%zu upstream_tracking_size=%zu -> missed=%lld bytes "
+        "(real GPU memory allocated but _total_allocated_bytes not incremented); "
+        "running_total_untracked=%lld\n",
+        n, pre_allocation_inc, post_allocation_inc, reservation_size,
+        allocation_size, upstream_tracking_size, missed,
+        total_untracked.load(std::memory_order_relaxed));
+      std::fflush(stderr);
+    }
+  }
+
   return upstream_tracking_size;
 }
 
@@ -455,6 +516,22 @@ void impl_type::deallocate(cuda::stream_ref stream,
     if (pre_deallocation_size <= reservation_size) {
       // if it was made using the reserved space
       upstream_reclaimed_bytes = 0;
+      // [INSTRUMENTATION] cross-stream dealloc: this stream's reservation never charged
+      // for this buffer (the buffer was alloc'd on a different stream with no reservation
+      // attached). The sub() above just drove arena.allocated_bytes negative.
+      if (post_deallocation_size < 0) {
+        static std::atomic<int> count{0};
+        int n = count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 50) {
+          std::fprintf(
+            stderr,
+            "[CROSS-STREAM-DEALLOC #%d] tracking=%zu arena.allocated_bytes %ld -> %ld "
+            "(NEGATIVE; reservation_size=%ld) -> upstream_reclaimed=0 -> "
+            "_total_allocated_bytes NOT decremented\n",
+            n, tracking_bytes, pre_deallocation_size, post_deallocation_size, reservation_size);
+          std::fflush(stderr);
+        }
+      }
     } else if (post_deallocation_size < reservation_size) {
       // if it was partially made using the reserved space
       upstream_reclaimed_bytes = static_cast<std::size_t>(pre_deallocation_size - reservation_size);
@@ -508,9 +585,60 @@ void impl_type::do_release_reservation(device_reserved_arena* arena) noexcept
     released_bytes = static_cast<std::size_t>(arena_size - allocation_size);
   }
 
+  // [INSTRUMENTATION] inflated release: when allocation_size is negative (caused by the
+  // cross-stream dealloc pattern), released_bytes = arena_size - allocation_size =
+  // arena_size + |allocation_size|. Subtracted from _total_allocated_bytes, this drains
+  // the global counter by MORE than the reservation's true contribution.
+  if (allocation_size < 0) {
+    static std::atomic<int> count{0};
+    static std::atomic<int> wrap_count{0};
+    auto cur_total =
+      static_cast<long long>(_total_allocated_bytes.load(std::memory_order_relaxed));
+    int n = count.fetch_add(1, std::memory_order_relaxed);
+    bool would_wrap =
+      cur_total >= 0 && static_cast<long long>(released_bytes) > cur_total;
+    if (would_wrap) {
+      int wn = wrap_count.fetch_add(1, std::memory_order_relaxed);
+      std::fprintf(stderr,
+                   "[!!! WRAP-OBSERVED #%d !!!] arena_size=%ld alloc_bytes=%ld "
+                   "released_bytes=%zu cur_counter=%lld -> fetch_sub will WRAP "
+                   "this counter to ~UINT64_MAX (PR #100 hides the symptom)\n",
+                   wn, arena_size, allocation_size, released_bytes, cur_total);
+      std::fflush(stderr);
+    }
+    if (n < 50 || would_wrap) {
+      std::fprintf(stderr,
+                   "[INFLATED-RELEASE #%d] arena_size=%ld alloc_bytes=%ld -> "
+                   "released_bytes=%zu (over-drain by %ld bytes); "
+                   "_total_allocated_bytes before sub = %lld\n",
+                   n,
+                   arena_size,
+                   allocation_size,
+                   released_bytes,
+                   -allocation_size,
+                   cur_total);
+      std::fflush(stderr);
+    }
+  }
+
   _number_of_allocations.fetch_sub(1);
   _total_reserved_bytes.fetch_sub(static_cast<std::size_t>(std::max(int64_t{0}, arena_size)));
-  _total_allocated_bytes.sub(released_bytes);
+  // [INSTRUMENTATION] capture wrap as it happens — sub() returns the new value;
+  // if it's huge (UINT64_MAX-region), the unsigned subtract underflowed.
+  std::size_t post_sub = _total_allocated_bytes.sub(released_bytes);
+  if (post_sub > (std::size_t{1} << 60) && released_bytes > 0) {
+    static std::atomic<int> wrap_n{0};
+    int wn = wrap_n.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[!!! WRAP-FIRED #%d !!!] released=%zu -> _total_allocated_bytes "
+                 "WRAPPED to %zu. Every subsequent try_add(size, limit) in "
+                 "do_reserve / do_allocate_unmanaged will fail because "
+                 "current > limit. PR #100 silences should_downgrade_memory but "
+                 "the engine is now bricked: queries fail with POOL_EXHAUSTED "
+                 "while nvidia-smi shows free GPU memory.\n",
+                 wn, released_bytes, post_sub);
+    std::fflush(stderr);
+  }
 }
 
 void impl_type::set_default_policy(std::unique_ptr<reservation_limit_policy> policy)
